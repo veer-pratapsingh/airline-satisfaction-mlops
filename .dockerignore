@@ -1,0 +1,18 @@
+# Keep the image small and reproducible — regenerate data/models in-pipeline.
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.claude/
+mlruns/
+EDA/
+logs/
+
+# Large generated artifacts (produced by the data/train stages, not baked in).
+prepared_data/
+feature_repo/feature_repo/data/
+*.joblib
+
+# Local notebooks / scratch
+*.ipynb

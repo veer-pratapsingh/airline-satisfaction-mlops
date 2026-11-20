@@ -1,0 +1,120 @@
+# =============================================================================
+# Airline-satisfaction MLOps pipeline.
+#
+# Runs on the university GitLab runner. Pushing to this repo triggers the CI
+# pipeline; jobs reach cluster services (MLflow, Feast, Garage/S3, Pushgateway)
+# by their internal hostnames. See DEPLOYMENT.md.
+# =============================================================================
+
+stages:
+  - build-images
+  - data
+  - train
+  - online-infer
+  # Future MLOps loop (data/model refresh) — left as documented stubs:
+  # - extend-data
+  # - extend-train
+  # - online-infer-v2
+
+variables:
+  DOCKER_BUILDKIT: "1"
+  BUILDKIT_PROGRESS: "plain"
+  # Built once in build-images, reused by every later job.
+  IMAGE: "${CI_REGISTRY_IMAGE}/pipeline:${CI_COMMIT_SHORT_SHA}"
+
+  # --- Server service endpoints (reachable from the runner) ------------------
+  MLFLOW_TRACKING_URI: "http://mlflow:5000"
+  MLFLOW_EXPERIMENT_NAME: "airline_satisfaction_top_features"
+  FEAST_URL: "http://feast:6000"
+  PUSHGATEWAY_URL: "http://pushgateway:9091/pushgateway"
+
+  # --- Object storage (Garage, S3-compatible) for MLflow artifacts -----------
+  AWS_ENDPOINT_URL: "http://garage:3900"
+  AWS_ENDPOINT_URL_S3: "http://garage:3900"
+  MLFLOW_S3_ENDPOINT_URL: "http://garage:3900"
+  AWS_REGION: "garage"
+  AWS_DEFAULT_REGION: "garage"
+
+  # --- Feast file data on Garage (each FileSource carries s3_endpoint_override) ---
+  FEAST_SOURCE_URI: "s3://feast"        # offline feature parquets
+  FEAST_DATASET_URI: "s3://datasets"    # saved point-in-time training dataset
+
+  # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and POSTGRES_FEAST_PASSWORD
+  # are set as masked CI/CD variables in GitLab → Settings → CI/CD → Variables.
+
+  # --- Postgres-backed Feast online store ------------------------------------
+  POSTGRES_FEAST_HOST: "postgres"
+  POSTGRES_FEAST_PORT: "5432"
+  POSTGRES_FEAST_DB: "feast"
+  POSTGRES_FEAST_USER: "feast"
+  PGSSLMODE: "disable"           # Uni Postgres does not use SSL
+
+# Default execution image for the data/train/infer jobs.
+default:
+  image: "${IMAGE}"
+
+# -----------------------------------------------------------------------------
+# Stage 1 — build the pipeline image and push it to the project registry.
+# -----------------------------------------------------------------------------
+build-image:
+  stage: build-images
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    LATEST: "${CI_REGISTRY_IMAGE}/pipeline:latest"
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - docker pull "$LATEST" || true
+    - docker build --cache-from "$LATEST" -t "$IMAGE" -t "$LATEST" .
+    - docker push "$IMAGE"
+    - docker push "$LATEST"
+
+# -----------------------------------------------------------------------------
+# Stage 2 — build the Feast feature data from the raw CSV.
+#   prepare_data -> setup_feast -> split_features -> feast apply -> saved dataset
+# -----------------------------------------------------------------------------
+data:
+  stage: data
+  before_script:
+    - cp feature_repo/feature_repo/feature_store.yaml.server feature_repo/feature_repo/feature_store.yaml
+  script:
+    - python prepare_data.py
+    - python setup_feast.py
+    - python split_features.py
+    - python apply_features.py
+    - python create_training_dataset.py
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - prepared_data/
+      - feature_repo/feature_repo/data/   # parquet, registry.db, saved dataset
+
+# -----------------------------------------------------------------------------
+# Stage 3 — rank features and train the model panel, tracked in MLflow.
+# -----------------------------------------------------------------------------
+train:
+  stage: train
+  before_script:
+    - cp feature_repo/feature_repo/feature_store.yaml.server feature_repo/feature_repo/feature_store.yaml
+  script:
+    - python rank_features.py
+    - python train_top_features.py
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - feature_ranking.csv
+      - feature_repo/feature_repo/model_*.joblib
+
+# -----------------------------------------------------------------------------
+# Stage 4 — materialize features to the online store and serve predictions.
+# -----------------------------------------------------------------------------
+online-infer:
+  stage: online-infer
+  before_script:
+    - cp feature_repo/feature_repo/feature_store.yaml.server feature_repo/feature_repo/feature_store.yaml
+  script:
+    - python materialize_online.py
+    - python predict_online.py
